@@ -1,6 +1,6 @@
 'use strict';
-// 验收测试总入口：按「有效授权 → 篡改子节点引用 → 非规范 RLP」三大场景，
-// 穿插运行 证明内核校验 / 结果页构建检查 / API 与 HTTP（含健康端点）冒烟。
+// 验收测试总入口：按「有效授权 → 篡改子节点引用 → 非规范 RLP → 前缀标识（短标识值槽 vs 子标识叶）」
+// 场景穿插运行 证明内核校验 / 结果页构建检查 / API 与 HTTP（含健康端点）冒烟。
 const { createHarness, assert } = require('./harness');
 const { buildSnapshots } = require('./fixtures');
 const { verifyProof } = require('../src/verifier');
@@ -10,7 +10,7 @@ const { createServer } = require('../src/server');
 const { keccak256 } = require('../src/keccak');
 const rlp = require('../src/rlp');
 const hp = require('../src/hexpath');
-const { toHex, fromHex, bytesToNibbles, equalBytes } = require('../src/hexutil');
+const { toHex, fromHex, bytesToNibbles, keyHexToNibbles, equalBytes } = require('../src/hexutil');
 
 const B = (hex) => fromHex(hex);
 const U = (...xs) => Uint8Array.of(...xs);
@@ -453,6 +453,182 @@ async function main() {
     test('证明内核：32 字节根哈希以外的输入被拒绝', () => {
       a.equal(verifyProof(U(1, 2, 3), [1], proofAuth).code, 'BAD_ROOT');
       a.equal(verifyProof(snap.rootHash, [1, 99], proofAuth).code, 'BAD_KEY');
+    });
+  });
+
+  // ========== 前缀标识：短标识值槽终结 vs 子标识叶 ==========
+  await suite('前缀标识：短标识（值槽 00）与子标识（叶 01）各自结论').run(async () => {
+    // 同一快照中：短标识 b5 承诺 00（落于分支值槽），子标识 b50 = b5 + 半字节 0 承诺 01。
+    const keyShort = snap.keys.prefixShort;
+    const keyChild = snap.keys.prefixChild;
+    const proofShort = snap.proofFor(keyShort);
+    const proofChild = snap.proofFor(keyChild);
+
+    test('证明内核：短标识终结于分支值槽 -> unauthorized 且值 00，不沿用子标识的 01', () => {
+      const res = verifyProof(snap.rootHash, keyHexToNibbles(keyShort), proofShort);
+      a.equal(res.status, 'unauthorized');
+      a.equal(res.authorized, false);
+      a.equal(res.value, '00');
+      a.equal(res.consumedPath, keyShort);
+      a.equal(res.firstFailedLayer, null);
+      // 终止层为分支值槽（槽 16），而非子标识的叶
+      const last = res.layers[res.layers.length - 1];
+      a.equal(last.kind, 'branch-value');
+      a.equal(last.slot, 16);
+      a.equal(last.value, '00');
+      a.equal(last.cumulativePath, keyShort);
+      // 回放证据不含任何叶层，且没有任何一层携带子标识的 01 值
+      a.ok(res.layers.every((l) => l.kind !== 'leaf'));
+      a.ok(res.layers.every((l) => l.value !== '01'));
+      // 逐层路径：根分支消费 b、扩展消费 5、值槽层不再消费半字节
+      a.equal(res.layers.length, 3);
+      a.equal(res.layers[0].kind, 'branch');
+      a.equal(res.layers[0].cumulativePath, 'b');
+      a.equal(res.layers[0].childReference, 'hash-32');
+      a.equal(res.layers[1].kind, 'extension');
+      a.equal(res.layers[1].cumulativePath, keyShort);
+      a.equal(res.layers[1].childReference, 'hash-32');
+      a.equal(res.layers[2].consumedNibbles, '');
+      // 节点摘要可复算：每层 nodeHash 与对应证明节点重算的 Keccak-256 一致，首层即根哈希
+      res.layers.forEach((layer, i) => {
+        a.equal(layer.nodeHash, toHex(keccak256(proofShort[i])));
+      });
+      a.equal(res.layers[0].nodeHash, snap.rootHashHex);
+    });
+
+    test('证明内核：子标识（短标识 + 一个半字节）-> authorized 且值 01', () => {
+      const res = verifyProof(snap.rootHash, keyHexToNibbles(keyChild), proofChild);
+      a.equal(res.status, 'authorized');
+      a.equal(res.authorized, true);
+      a.equal(res.value, '01');
+      a.equal(res.consumedPath, keyChild);
+      // 终止层为内嵌于第 3 层分支槽 0 的叶
+      const last = res.layers[res.layers.length - 1];
+      a.equal(last.kind, 'leaf');
+      a.equal(last.value, '01');
+      a.equal(last.reference, 'embedded-node');
+      a.equal(last.embeddedInLayer, 3);
+      a.equal(res.layers[2].kind, 'branch');
+      a.equal(res.layers[2].slot, 0);
+      a.equal(res.layers[2].childReference, 'embedded-node');
+      // 摘要可复算：散列引用层对证明节点重算；内嵌叶对父节点槽 0 重编码后重算
+      res.layers.slice(0, 3).forEach((layer, i) => {
+        a.equal(layer.nodeHash, toHex(keccak256(proofChild[i])));
+      });
+      const branchDecoded = rlp.decode(proofChild[2]);
+      a.equal(last.nodeHash, toHex(keccak256(rlp.encode(branchDecoded[0]))));
+    });
+
+    test('证明内核：反向——短标识自身值 01 时值槽终结仍授权，子标识值不影响', () => {
+      const { Trie } = require('../src/trie');
+      const t = new Trie();
+      t.put(keyHexToNibbles('ab'), U(0x01)); // 短标识值 01（值槽）
+      t.put(keyHexToNibbles('ab0def'), U(0x00)); // 子标识值 00（不得影响短标识结论）
+      t.commit();
+      const res = verifyProof(t.rootHash, keyHexToNibbles('ab'), t.proveKey(keyHexToNibbles('ab')));
+      a.equal(res.status, 'authorized');
+      a.equal(res.value, '01');
+      a.equal(res.consumedPath, 'ab');
+      const last = res.layers[res.layers.length - 1];
+      a.equal(last.kind, 'branch-value');
+      a.equal(last.slot, 16);
+      // 子标识仍是自己的结论：unauthorized 且值 00
+      const resChild = verifyProof(t.rootHash, keyHexToNibbles('ab0def'), t.proveKey(keyHexToNibbles('ab0def')));
+      a.equal(resChild.status, 'unauthorized');
+      a.equal(resChild.value, '00');
+      a.equal(resChild.consumedPath, 'ab0def');
+    });
+
+    test('证明内核：值槽终结后仍有多余节点 -> TAIL_DUPLICATE 重复尾节点', () => {
+      const withTail = proofShort.concat([Uint8Array.from(proofShort[proofShort.length - 1])]);
+      const res = verifyProof(snap.rootHash, keyHexToNibbles(keyShort), withTail);
+      a.equal(res.status, 'invalid');
+      a.equal(res.code, 'TAIL_DUPLICATE');
+      a.match(res.reason, /重复尾节点/);
+      a.equal(res.firstFailedLayer, 4);
+      // 已抵达值槽的终止证据保留
+      a.equal(res.layers.length, 3);
+      a.equal(res.layers[2].kind, 'branch-value');
+      a.equal(res.layers[2].value, '00');
+    });
+
+    test('证明内核：分支值槽为空 -> PATH_INCOMPLETE（标识未被承诺）', () => {
+      const branch = new Array(17).fill(U());
+      branch[0] = [hp.encode([], true), U(0x01)]; // 槽 0 内嵌叶，值槽（16）留空
+      const node = rlp.encode(branch);
+      const res = verifyProof(keccak256(node), [], [node]);
+      a.equal(res.status, 'invalid');
+      a.equal(res.code, 'PATH_INCOMPLETE');
+      a.match(res.reason, /值槽（16）为空/);
+      a.equal(res.firstFailedLayer, 1);
+    });
+
+    test('证明内核：篡改前缀证明的分支节点 -> REF_MISMATCH 第 3 层', () => {
+      const tampered = proofShort.map((p) => Uint8Array.from(p));
+      tampered[2][tampered[2].length - 1] ^= 0x01;
+      const res = verifyProof(snap.rootHash, keyHexToNibbles(keyShort), tampered);
+      a.equal(res.status, 'invalid');
+      a.equal(res.code, 'REF_MISMATCH');
+      a.equal(res.firstFailedLayer, 3);
+      a.match(res.reason, /父子引用不符/);
+      a.equal(res.layers.length, 2);
+    });
+
+    test('页面构建：短标识结果页显示“未授权”，保留值槽终止证据与值 00', () => {
+      const res = verifyProof(snap.rootHash, keyHexToNibbles(keyShort), proofShort);
+      const page = buildResultPage(res, { rootHash: snap.rootHashHex, keyHex: keyShort, nodeCount: proofShort.length });
+      a.match(page, /未授权/);
+      a.match(page, /路径完整抵达分支节点的值槽/);
+      a.match(page, /分支节点（值槽）/);
+      a.match(page, /16（值槽）/);
+      a.match(page, /0x00/);
+      a.equal(page.includes('banner-title">已授权'), false);
+      a.equal(page.includes('证明无效'), false);
+      // 结论与证据均不引用子标识的 01 叶值：全页仅值槽一处“叶/槽值”
+      a.equal((page.match(/叶\/槽值/g) || []).length, 1);
+    });
+
+    test('页面构建：子标识结果页显示“已授权”且叶值 01', () => {
+      const res = verifyProof(snap.rootHash, keyHexToNibbles(keyChild), proofChild);
+      const page = buildResultPage(res, { rootHash: snap.rootHashHex, keyHex: keyChild, nodeCount: proofChild.length });
+      a.match(page, /已授权/);
+      a.match(page, /叶值为 <code>0x01<\/code>/);
+      a.match(page, /内嵌节点/);
+      a.equal(page.includes('证明无效'), false);
+    });
+
+    test('API：短标识与子标识分别返回各自结论', () => {
+      const outShort = handleVerify({
+        rootHash: snap.rootHashHex,
+        keyHex: keyShort,
+        proofNodes: proofShort.map((p) => toHex(p)).join('\n'),
+      });
+      a.equal(outShort.httpStatus, 200);
+      a.equal(outShort.result.status, 'unauthorized');
+      a.equal(outShort.result.value, '00');
+      a.match(outShort.page, /未授权/);
+      const outChild = handleVerify({
+        rootHash: snap.rootHashHex,
+        keyHex: keyChild,
+        proofNodes: proofChild.map((p) => toHex(p)).join('\n'),
+      });
+      a.equal(outChild.result.status, 'authorized');
+      a.equal(outChild.result.value, '01');
+      a.match(outChild.page, /已授权/);
+    });
+
+    test('HTTP 冒烟：POST 短标识/子标识证明分别得到未授权/已授权页面', async () => {
+      const resShort = await postVerify(snap.rootHashHex, keyShort, proofShort.map((p) => toHex(p)).join('\n'));
+      a.equal(resShort.status, 200);
+      const dataShort = await resShort.json();
+      a.equal(dataShort.result.status, 'unauthorized');
+      a.equal(dataShort.result.value, '00');
+      a.match(dataShort.page, /未授权/);
+      const resChild = await postVerify(snap.rootHashHex, keyChild, proofChild.map((p) => toHex(p)).join('\n'));
+      const dataChild = await resChild.json();
+      a.equal(dataChild.result.status, 'authorized');
+      a.equal(dataChild.result.value, '01');
+      a.match(dataChild.page, /已授权/);
     });
   });
 

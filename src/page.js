@@ -25,16 +25,21 @@ const REF_LABEL = {
 };
 
 function statusBanner(result) {
+  // 终止方式：叶节点，或精确标识耗尽半字节后抵达的分支值槽（槽 16）。
+  const terminal = result.layers[result.layers.length - 1];
+  const atValueSlot = !!terminal && terminal.kind === 'branch-value';
+  const where = atValueSlot ? '分支节点的值槽' : '叶节点';
+  const what = atValueSlot ? '槽值' : '叶值';
   if (result.status === 'authorized') {
     return `<div class="banner banner-ok" role="status">
       <span class="banner-title">已授权</span>
-      <span class="banner-sub">证明有效，叶值为 <code>0x${esc(result.value)}</code>（启用承诺 <code>01</code>）</span>
+      <span class="banner-sub">证明有效，${what}为 <code>0x${esc(result.value)}</code>（启用承诺 <code>01</code>）</span>
     </div>`;
   }
   if (result.status === 'unauthorized') {
     return `<div class="banner banner-no" role="status">
       <span class="banner-title">未授权</span>
-      <span class="banner-sub">路径完整抵达叶节点，但叶值为 <code>0x${esc(result.value)}</code>，并非启用承诺 <code>01</code>。路径证据保留如下。</span>
+      <span class="banner-sub">路径完整抵达${where}，但${what}为 <code>0x${esc(result.value)}</code>，并非启用承诺 <code>01</code>。路径证据保留如下。</span>
     </div>`;
   }
   return `<div class="banner banner-bad" role="alert">

@@ -1,6 +1,6 @@
 'use strict';
 // 对运行中的 web 服务执行端到端 HTTP 冒烟：
-//   健康端点 / 静态入口页 / 示例快照 / 有效授权 / 篡改子节点引用 / 非规范 RLP
+//   健康端点 / 静态入口页 / 示例快照 / 有效授权 / 篡改子节点引用 / 非规范 RLP / 前缀标识（短标识值槽 vs 子标识叶）
 // 用法：BASE_URL=http://web:8080 node test/http-smoke.js
 // 任一检查失败即以非零退出码结束。
 const BASE = process.env.BASE_URL || 'http://127.0.0.1:8080';
@@ -50,6 +50,7 @@ function keccak256Local(bytes) {
   return require('../src/keccak').keccak256(bytes);
 }
 const { toHex } = require('../src/hexutil');
+const { buildSnapshots } = require('../src/sample-snapshot');
 
 async function main() {
   console.log(`HTTP 冒烟目标：${BASE}`);
@@ -115,6 +116,31 @@ async function main() {
     no.json.result && no.json.result.status === 'unauthorized' &&
     no.json.result.value === '00' && no.json.result.layers.length > 0);
   check('未授权页明确显示“未授权”', no.json.page.includes('未授权'));
+
+  // 前缀场景：同一快照中短标识（值槽 00）是子标识（叶 01）的前缀。
+  // 本地按同一构造器重放快照，根哈希须与服务端示例一致。
+  const local = buildSnapshots();
+  check('本地重放缓照与示例根哈希一致', local.rootHashHex === sample.rootHash);
+  const mkProof = (keyHex) => ({
+    rootHash: local.rootHashHex,
+    keyHex,
+    proofNodes: local.proofFor(keyHex).map((p) => toHex(p)),
+  });
+  const short = await postJson('/api/verify', mkProof(local.keys.prefixShort));
+  check('前缀短标识：status=unauthorized 且值槽值 00、路径恰好为短标识',
+    short.json.result && short.json.result.status === 'unauthorized' &&
+    short.json.result.value === '00' && short.json.result.consumedPath === local.keys.prefixShort &&
+    short.json.result.layers[short.json.result.layers.length - 1].kind === 'branch-value',
+    JSON.stringify(short.json.result && short.json.result.status));
+  check('前缀短标识页显示“未授权”且含值槽终止证据、无“已授权”横幅',
+    short.json.page.includes('未授权') && short.json.page.includes('分支节点（值槽）') &&
+    !short.json.page.includes('banner-title">已授权'));
+  const child = await postJson('/api/verify', mkProof(local.keys.prefixChild));
+  check('子标识：status=authorized 且叶值 01、路径为短标识 + 一个半字节',
+    child.json.result && child.json.result.status === 'authorized' &&
+    child.json.result.value === '01' && child.json.result.consumedPath === local.keys.prefixChild,
+    JSON.stringify(child.json.result && child.json.result.status));
+  check('子标识页显示“已授权”', child.json.page.includes('已授权'));
 
   console.log(`\nHTTP 冒烟：${failures === 0 ? '全部通过 ✅' : failures + ' 项失败'}`);
   process.exitCode = failures === 0 ? 0 : 1;

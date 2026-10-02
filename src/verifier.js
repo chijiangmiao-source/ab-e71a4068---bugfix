@@ -268,33 +268,52 @@ function verifyProof(rootHash, keyNibbles, proofNodes) {
       }
     }
 
+    // 半字节耗尽：精确标识在分支节点处终结，其承诺值位于值槽（槽 16）。
+    // 必须读取值槽作为终止证据——不得继续下潜到子标识所在的子树沿用其叶值。
     if (remainder.length === 0) {
-      const fallbackSlot = node[0];
+      const valueSlot = node[16];
       const digest = nodeDigest(node);
-      if (isBytes(fallbackSlot) && fallbackSlot.length === 0) {
-        return invalid('PATH_INCOMPLETE', `第 ${layerNo} 层：路径残缺——半字节已耗尽且未找到后续子节点`, layerNo, layers, consumed);
+      if (valueSlot.length === 0) {
+        return invalid(
+          'PATH_INCOMPLETE',
+          `第 ${layerNo} 层：路径残缺——分支值槽（16）为空，标识未在快照中承诺`,
+          layerNo,
+          layers,
+          consumed
+        );
       }
-      const child = resolveChild(fallbackSlot);
       layers.push({
         layer: layerNo,
-        kind: 'branch',
+        kind: 'branch-value',
         reference: nodeRef.mode,
         embeddedInLayer: nodeRef.parentLayer ?? null,
         nodeHash: digest.hash,
         rlpSize: digest.rlpSize,
-        slot: 0,
+        slot: 16,
         consumedNibbles: '',
         cumulativePath: nibblesToHex(consumed),
-        childReference: Array.isArray(fallbackSlot) ? 'embedded-node' : 'hash-32',
-        childHash: isBytes(fallbackSlot) && fallbackSlot.length === 32 ? toHex(fallbackSlot) : null,
+        value: toHex(valueSlot),
       });
-      if (child.errorCode) {
-        const atLayer = child.errorCode === 'BAD_REF' ? layerNo : layerNo + 1;
-        return invalid(child.errorCode, `第 ${atLayer} 层：${child.error}`, atLayer, layers, consumed);
+      if (proofIdx < decoded.length) {
+        return invalid(
+          'TAIL_DUPLICATE',
+          `分支值槽终结之后仍有 ${decoded.length - proofIdx} 个未消费节点（重复尾节点/冗余证据）`,
+          layerNo + 1,
+          layers,
+          consumed
+        );
       }
-      node = child.raw;
-      nodeRef = child.embedded ? { mode: 'embedded-node', parentLayer: layerNo } : { mode: 'hash-32' };
-      continue;
+      const authorized = valueSlot.length === 1 && valueSlot[0] === 0x01;
+      return {
+        status: authorized ? 'authorized' : 'unauthorized',
+        authorized,
+        value: toHex(valueSlot),
+        code: null,
+        reason: null,
+        firstFailedLayer: null,
+        layers,
+        consumedPath: nibblesToHex(consumed),
+      };
     }
 
     const idx = remainder[0];
