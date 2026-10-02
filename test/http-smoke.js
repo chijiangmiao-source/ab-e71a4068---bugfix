@@ -1,6 +1,7 @@
 'use strict';
 // 对运行中的 web 服务执行端到端 HTTP 冒烟：
 //   健康端点 / 静态入口页 / 示例快照 / 有效授权 / 篡改子节点引用 / 非规范 RLP
+//   / 前缀标识（短标识值槽 00 vs 追加半字节子标识叶 01，及反向值槽 01）
 // 用法：BASE_URL=http://web:8080 node test/http-smoke.js
 // 任一检查失败即以非零退出码结束。
 const BASE = process.env.BASE_URL || 'http://127.0.0.1:8080';
@@ -50,6 +51,7 @@ function keccak256Local(bytes) {
   return require('../src/keccak').keccak256(bytes);
 }
 const { toHex } = require('../src/hexutil');
+const { buildPrefixSnapshots } = require('./fixtures');
 
 async function main() {
   console.log(`HTTP 冒烟目标：${BASE}`);
@@ -115,6 +117,39 @@ async function main() {
     no.json.result && no.json.result.status === 'unauthorized' &&
     no.json.result.value === '00' && no.json.result.layers.length > 0);
   check('未授权页明确显示“未授权”', no.json.page.includes('未授权'));
+
+  // 前缀关系：短标识（分支值槽 00）不得沿用追加半字节子标识的叶值 01
+  const px = buildPrefixSnapshots();
+  const pxPost = (keyHex) => postJson('/api/verify', {
+    rootHash: px.rootHashHex,
+    keyHex,
+    proofNodes: px.proofFor(keyHex).map((p) => toHex(p)),
+  });
+  const pxShort = await pxPost(px.keys.prefixShort);
+  check('前缀短标识：status=unauthorized 且结论值为自身值槽 00',
+    pxShort.json.result && pxShort.json.result.status === 'unauthorized' &&
+    pxShort.json.result.value === '00' && pxShort.json.result.consumedPath === px.keys.prefixShort,
+    JSON.stringify(pxShort.json.result && pxShort.json.result.status));
+  check('前缀短标识：终止于分支值槽层（未下探子标识叶）',
+    pxShort.json.result && pxShort.json.result.layers.length > 0 &&
+    pxShort.json.result.layers[pxShort.json.result.layers.length - 1].kind === 'branch-value' &&
+    !pxShort.json.result.layers.some((l) => l.kind === 'leaf'));
+  check('前缀短标识页显示“未授权”与值槽终止证据',
+    pxShort.json.page.includes('未授权') && pxShort.json.page.includes('分支节点（值槽）') &&
+    !pxShort.json.page.includes('banner-title">已授权'));
+
+  const pxChild = await pxPost(px.keys.prefixChild);
+  check('子标识（短标识 + 半字节 0）：status=authorized 且叶值 01',
+    pxChild.json.result && pxChild.json.result.status === 'authorized' &&
+    pxChild.json.result.value === '01' && pxChild.json.result.consumedPath === px.keys.prefixChild,
+    JSON.stringify(pxChild.json.result && pxChild.json.result.status));
+
+  const pxReverse = await pxPost(px.keys.reverseShort);
+  check('反向短标识（值槽 01）：status=authorized',
+    pxReverse.json.result && pxReverse.json.result.status === 'authorized' &&
+    pxReverse.json.result.value === '01' &&
+    pxReverse.json.result.layers[pxReverse.json.result.layers.length - 1].kind === 'branch-value',
+    JSON.stringify(pxReverse.json.result && pxReverse.json.result.status));
 
   console.log(`\nHTTP 冒烟：${failures === 0 ? '全部通过 ✅' : failures + ' 项失败'}`);
   process.exitCode = failures === 0 ? 0 : 1;

@@ -24,17 +24,34 @@ const REF_LABEL = {
   'embedded-node': '内嵌节点（父节点 RLP 内联）',
 };
 
+// 终止方式：叶节点终结，或分支值槽（16）终结（精确标识是更长标识的前缀）。
+function terminalOf(result) {
+  const last = result.layers[result.layers.length - 1];
+  if (last && last.kind === 'branch-value') {
+    return {
+      authorizedLead: '证明有效，分支值槽（16）的承诺值为',
+      unauthorizedLead: '路径完整抵达分支值槽（16）（精确标识终止于此），但承诺值为',
+    };
+  }
+  return {
+    authorizedLead: '证明有效，叶值为',
+    unauthorizedLead: '路径完整抵达叶节点，但叶值为',
+  };
+}
+
 function statusBanner(result) {
   if (result.status === 'authorized') {
+    const t = terminalOf(result);
     return `<div class="banner banner-ok" role="status">
       <span class="banner-title">已授权</span>
-      <span class="banner-sub">证明有效，叶值为 <code>0x${esc(result.value)}</code>（启用承诺 <code>01</code>）</span>
+      <span class="banner-sub">${t.authorizedLead} <code>0x${esc(result.value)}</code>（启用承诺 <code>01</code>）</span>
     </div>`;
   }
   if (result.status === 'unauthorized') {
+    const t = terminalOf(result);
     return `<div class="banner banner-no" role="status">
       <span class="banner-title">未授权</span>
-      <span class="banner-sub">路径完整抵达叶节点，但叶值为 <code>0x${esc(result.value)}</code>，并非启用承诺 <code>01</code>。路径证据保留如下。</span>
+      <span class="banner-sub">${t.unauthorizedLead} <code>0x${esc(result.value)}</code>，并非启用承诺 <code>01</code>。路径证据保留如下。</span>
     </div>`;
   }
   return `<div class="banner banner-bad" role="alert">

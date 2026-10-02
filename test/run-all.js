@@ -1,8 +1,8 @@
 'use strict';
-// 验收测试总入口：按「有效授权 → 篡改子节点引用 → 非规范 RLP」三大场景，
-// 穿插运行 证明内核校验 / 结果页构建检查 / API 与 HTTP（含健康端点）冒烟。
+// 验收测试总入口：按「有效授权 → 篡改子节点引用 → 非规范 RLP → 前缀标识（短标识值槽 vs 子标识叶）」
+// 场景穿插运行 证明内核校验 / 结果页构建检查 / API 与 HTTP（含健康端点）冒烟。
 const { createHarness, assert } = require('./harness');
-const { buildSnapshots } = require('./fixtures');
+const { buildSnapshots, buildPrefixSnapshots } = require('./fixtures');
 const { verifyProof } = require('../src/verifier');
 const { handleVerify, parseProofNodes } = require('../src/verify-api');
 const { buildResultPage, buildIndexPage } = require('../src/page');
@@ -10,7 +10,7 @@ const { createServer } = require('../src/server');
 const { keccak256 } = require('../src/keccak');
 const rlp = require('../src/rlp');
 const hp = require('../src/hexpath');
-const { toHex, fromHex, bytesToNibbles, equalBytes } = require('../src/hexutil');
+const { toHex, fromHex, bytesToNibbles, keyHexToNibbles, equalBytes } = require('../src/hexutil');
 
 const B = (hex) => fromHex(hex);
 const U = (...xs) => Uint8Array.of(...xs);
@@ -365,6 +365,163 @@ async function main() {
     test('证明内核：证明为空被拒绝', () => {
       const res = verifyProof(snap.rootHash, [1], []);
       a.equal(res.code, 'EMPTY_PROOF');
+    });
+  });
+
+  // ========== 前缀关系：短标识（分支值槽）vs 追加半字节的子标识（叶） ==========
+  await suite('前缀关系：短标识值槽终结与子标识叶终结分别裁决').run(async () => {
+    const px = buildPrefixSnapshots();
+    const { prefixShort, prefixChild, reverseShort, reverseChild } = px.keys;
+    const nibOf = (k) => keyHexToNibbles(k);
+
+    test('证明内核：短标识承诺 00 -> unauthorized，保留值槽终止证据，不沿用子标识的 01', () => {
+      const proof = px.proofFor(prefixShort);
+      const res = verifyProof(px.rootHash, nibOf(prefixShort), proof);
+      a.equal(res.status, 'unauthorized');
+      a.equal(res.authorized, false);
+      a.equal(res.value, '00', '结论值必须是精确标识自身的承诺值 00');
+      a.equal(res.consumedPath, prefixShort, '已消费路径应恰好终止于短标识');
+      a.equal(res.firstFailedLayer, null);
+      const last = res.layers[res.layers.length - 1];
+      a.equal(last.kind, 'branch-value');
+      a.equal(last.slot, 16);
+      a.equal(last.value, '00');
+      a.equal(last.cumulativePath, prefixShort);
+      // 逐层摘要可复算：每层给出 Keccak-256 摘要，根层摘要等于证明首节点散列
+      for (const layer of res.layers) a.match(layer.nodeHash, /^[0-9a-f]{64}$/);
+      a.equal(res.layers[0].nodeHash, toHex(keccak256(proof[0])));
+      // 短标识证明不得下探到子标识的叶（层数应止于值槽所在分支）
+      a.equal(res.layers.some((l) => l.kind === 'leaf'), false);
+    });
+
+    test('证明内核：子标识（短标识 + 半字节 0）承诺 01 -> authorized，与短标识共享前缀层', () => {
+      const resShort = verifyProof(px.rootHash, nibOf(prefixShort), px.proofFor(prefixShort));
+      const res = verifyProof(px.rootHash, nibOf(prefixChild), px.proofFor(prefixChild));
+      a.equal(res.status, 'authorized');
+      a.equal(res.authorized, true);
+      a.equal(res.value, '01');
+      a.equal(res.consumedPath, prefixChild);
+      const last = res.layers[res.layers.length - 1];
+      a.equal(last.kind, 'leaf');
+      a.equal(last.value, '01');
+      // 子标识在值槽所在分支处继续下探一层（槽 0 -> 内嵌叶）
+      a.equal(res.layers.length, resShort.layers.length + 1);
+      // 共同前缀层逐层一致（同一批节点，摘要可复算）
+      for (let i = 0; i < resShort.layers.length - 1; i++) {
+        a.equal(res.layers[i].nodeHash, resShort.layers[i].nodeHash);
+        a.equal(res.layers[i].cumulativePath, resShort.layers[i].cumulativePath);
+      }
+      // 分叉层：短标识在此取值槽终结，子标识经同一分支的槽 0 继续
+      const fork = res.layers[resShort.layers.length - 1];
+      a.equal(fork.kind, 'branch');
+      a.equal(fork.slot, 0);
+      a.equal(fork.nodeHash, resShort.layers[resShort.layers.length - 1].nodeHash);
+    });
+
+    test('证明内核：反向——短标识自身承诺 01 -> authorized（值槽终结）', () => {
+      const res = verifyProof(px.rootHash, nibOf(reverseShort), px.proofFor(reverseShort));
+      a.equal(res.status, 'authorized');
+      a.equal(res.authorized, true);
+      a.equal(res.value, '01');
+      a.equal(res.consumedPath, reverseShort);
+      const last = res.layers[res.layers.length - 1];
+      a.equal(last.kind, 'branch-value');
+      a.equal(last.slot, 16);
+    });
+
+    test('证明内核：反向——子标识承诺 00 -> unauthorized（叶终结）', () => {
+      const res = verifyProof(px.rootHash, nibOf(reverseChild), px.proofFor(reverseChild));
+      a.equal(res.status, 'unauthorized');
+      a.equal(res.value, '00');
+      a.equal(res.consumedPath, reverseChild);
+      a.equal(res.layers[res.layers.length - 1].kind, 'leaf');
+    });
+
+    test('证明内核：结论可复算——同一输入重复核验结果逐字节一致', () => {
+      for (const key of [prefixShort, prefixChild, reverseShort, reverseChild]) {
+        const first = verifyProof(px.rootHash, nibOf(key), px.proofFor(key));
+        const second = verifyProof(px.rootHash, nibOf(key), px.proofFor(key));
+        a.deepEqual(second, first, `键 ${key} 的两次核验结论不一致`);
+      }
+    });
+
+    test('证明内核：值槽终结后仍有多余节点 -> TAIL_DUPLICATE', () => {
+      const proof = px.proofFor(prefixShort);
+      const withTail = proof.concat([Uint8Array.from(proof[proof.length - 1])]);
+      const res = verifyProof(px.rootHash, nibOf(prefixShort), withTail);
+      a.equal(res.status, 'invalid');
+      a.equal(res.code, 'TAIL_DUPLICATE');
+      a.match(res.reason, /重复尾节点/);
+    });
+
+    test('证明内核：半字节耗尽但分支值槽为空 -> PATH_INCOMPLETE', () => {
+      const { Trie } = require('../src/trie');
+      const t = new Trie();
+      t.put(keyHexToNibbles('9a0'), U(0x01));
+      t.put(keyHexToNibbles('9a1'), U(0x01));
+      t.commit();
+      // 键 9a 在分支处耗尽，但值槽（16）无承诺：证明对该精确标识不完整
+      const res = verifyProof(t.rootHash, keyHexToNibbles('9a'), t.proveKey(keyHexToNibbles('9a0')));
+      a.equal(res.status, 'invalid');
+      a.equal(res.code, 'PATH_INCOMPLETE');
+      a.match(res.reason, /路径残缺/);
+    });
+
+    test('页面构建：短标识未授权页标明分支值槽终止且不含子标识的 01 结论', () => {
+      const proof = px.proofFor(prefixShort);
+      const res = verifyProof(px.rootHash, nibOf(prefixShort), proof);
+      const page = buildResultPage(res, { rootHash: px.rootHashHex, keyHex: prefixShort, nodeCount: proof.length });
+      a.match(page, /未授权/);
+      a.match(page, /分支值槽（16）/);
+      a.match(page, /分支节点（值槽）/);
+      a.match(page, /16（值槽）/);
+      a.match(page, /0x00/);
+      a.match(page, new RegExp(prefixShort));
+      a.equal(page.includes('已授权</span>'), false);
+      a.equal(page.includes('证明无效'), false);
+    });
+
+    test('页面构建：反向短标识已授权页标明值槽承诺 01', () => {
+      const proof = px.proofFor(reverseShort);
+      const res = verifyProof(px.rootHash, nibOf(reverseShort), proof);
+      const page = buildResultPage(res, { rootHash: px.rootHashHex, keyHex: reverseShort, nodeCount: proof.length });
+      a.match(page, /已授权/);
+      a.match(page, /分支值槽（16）的承诺值为 <code>0x01<\/code>/);
+    });
+
+    test('API：短标识与子标识经 handleVerify 各自得到可复算结论', () => {
+      const shortOut = handleVerify({
+        rootHash: px.rootHashHex,
+        keyHex: prefixShort,
+        proofNodes: px.proofFor(prefixShort).map((p) => toHex(p)).join('\n'),
+      });
+      a.equal(shortOut.httpStatus, 200);
+      a.equal(shortOut.result.status, 'unauthorized');
+      a.equal(shortOut.result.value, '00');
+      a.equal(shortOut.result.consumedPath, prefixShort);
+      const childOut = handleVerify({
+        rootHash: px.rootHashHex,
+        keyHex: prefixChild, // 奇数长度标识（追加单个半字节）
+        proofNodes: px.proofFor(prefixChild).map((p) => toHex(p)),
+      });
+      a.equal(childOut.result.status, 'authorized');
+      a.equal(childOut.result.value, '01');
+      a.equal(childOut.result.consumedPath, prefixChild);
+    });
+
+    test('HTTP 冒烟：POST 前缀短标识返回未授权页面（值槽 00），子标识返回已授权', async () => {
+      const shortRes = await postVerify(px.rootHashHex, prefixShort, px.proofFor(prefixShort).map((p) => toHex(p)).join('\n'));
+      a.equal(shortRes.status, 200);
+      const shortData = await shortRes.json();
+      a.equal(shortData.result.status, 'unauthorized');
+      a.equal(shortData.result.value, '00');
+      a.match(shortData.page, /未授权/);
+      a.match(shortData.page, /分支节点（值槽）/);
+      const childRes = await postVerify(px.rootHashHex, prefixChild, px.proofFor(prefixChild).map((p) => toHex(p)).join('\n'));
+      const childData = await childRes.json();
+      a.equal(childData.result.status, 'authorized');
+      a.equal(childData.result.value, '01');
+      a.match(childData.page, /已授权/);
     });
   });
 
